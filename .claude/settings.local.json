@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \":*)",
+      "Bash(python patch_nb06.py)",
+      "Bash(del \"C:\\\\Users\\\\anton\\\\Music\\\\commodity_rl_trading\\\\patch_nb06.py\")",
+      "Bash(python \"C:\\\\Users\\\\anton\\\\.claude\\\\projects\\\\C--Users-anton-Music-commodity-rl-trading\\\\patch_cell0.py\")",
+      "Bash(python \"C:\\\\Users\\\\anton\\\\.claude\\\\projects\\\\C--Users-anton-Music-commodity-rl-trading\\\\patch_cell1.py\")",
+      "Bash(python3)",
+      "Bash(python)",
+      "Bash(dir \"C:\\\\Users\\\\anton\\\\Music\\\\commodity_rl_trading\\\\data\\\\raw\" /b)",
+      "Bash(dir \"C:\\\\Users\\\\anton\\\\Music\\\\commodity_rl_trading\\\\data\\\\processed\" /b)",
+      "Bash(dir \"C:\\\\Users\\\\anton\\\\Music\\\\commodity_rl_trading\\\\data\\\\features\" /b)",
+      "Bash(python -c ':*)",
+      "Bash(python -)",
+      "Bash(python -c \"import sys; [print\\(l,end=''\\) for l in sys.stdin if not any\\(x in l for x in ['tensorflow','oneDNN','TF_ENABLE']\\)]\")",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import hmmlearn; print\\('hmmlearn version:', hmmlearn.__version__\\)\")",
+      "Bash(pip install *)",
+      "Bash(where python *)",
+      "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(python -c \"import pandas\")",
+      "Bash(\"C:\\\\\\\\Python313\\\\\\\\python.exe\" -c \"import hmmlearn; print\\('OK', hmmlearn.__version__\\)\")",
+      "Bash(\"C:\\\\\\\\Python313\\\\\\\\python.exe\" -m pip install hmmlearn)",
+      "Bash(\"C:\\\\\\\\Python313\\\\\\\\python.exe\")",
+      "Bash('C:\\\\Python313\\\\python.exe' -c ' *)",
+      "Bash(\"C:\\\\Python313\\\\python.exe\")"
+    ]
+  }
+}

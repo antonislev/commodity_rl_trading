@@ -1,0 +1,55 @@
+{
+  "ara_ppo": {},
+  "standard_ppo": {},
+  "no_adaptive_clip": {},
+  "no_regime_critic": {},
+  "transformer_ara_ppo": {},
+  "buy_and_hold": {
+    "0": {
+      "total_return": {
+        "mean": 0.42179741032064566,
+        "std": 0.0
+      },
+      "ann_return": {
+        "mean": 0.5580289595328638,
+        "std": 0.0
+      },
+      "ann_vol": {
+        "mean": 0.40753329045876335,
+        "std": 5.551115123125783e-17
+      },
+      "sharpe": {
+        "mean": 1.3692843565436286,
+        "std": 0.0
+      },
+      "max_drawdown": {
+        "mean": -0.18601169786388497,
+        "std": 0.0
+      },
+      "calmar": {
+        "mean": 2.9999670216504755,
+        "std": 0.0
+      },
+      "sortino": {
+        "mean": 2.047660759973577,
+        "std": 0.0
+      },
+      "win_rate": {
+        "mean": 0.52,
+        "std": 0.0
+      },
+      "total_costs": {
+        "mean": 80.51342556616498,
+        "std": 0.0
+      },
+      "trade_count": {
+        "mean": 2.0,
+        "std": 0.0
+      },
+      "episode_length": {
+        "mean": 200.0,
+        "std": 0.0
+      }
+    }
+  }
+}

@@ -1,0 +1,136 @@
+{
+  "state_vector_features": {
+    "price": [
+      "log_return",
+      "roc_5",
+      "roc_21",
+      "price_to_sma_21",
+      "price_to_sma_50",
+      "price_to_sma_200",
+      "macd_diff",
+      "rsi_14_norm",
+      "bb_pct_20",
+      "bb_width_20",
+      "price_position_63",
+      "close_position"
+    ],
+    "volatility": [
+      "realized_vol_5d",
+      "realized_vol_21d",
+      "realized_vol_63d",
+      "vol_ratio_5_21",
+      "vol_ratio_21_63",
+      "atr_14_norm",
+      "parkinson_vol_21d",
+      "vol_surprise"
+    ],
+    "volume": [
+      "rel_volume_5",
+      "rel_volume_21",
+      "obv_signal",
+      "cmf",
+      "price_to_vwap",
+      "pv_corr_10"
+    ],
+    "curve": [
+      "curve_slope_1_3m",
+      "curve_slope_3_12m",
+      "carry_signal_21d",
+      "roll_period",
+      "month_sin",
+      "month_cos",
+      "quarter_sin",
+      "quarter_cos"
+    ],
+    "cross_commodity": [
+      "avg_cross_corr_21d",
+      "avg_cross_corr_63d"
+    ],
+    "calendar": [
+      "days_to_eia_norm",
+      "eia_report_day",
+      "days_to_opec_norm",
+      "opec_meeting_week",
+      "days_to_fomc_norm",
+      "fomc_meeting_week",
+      "event_pressure"
+    ],
+    "regime": [
+      "regime_vol",
+      "regime_trend",
+      "regime_momentum",
+      "regime_curve"
+    ]
+  },
+  "all_features": [
+    "log_return",
+    "roc_5",
+    "roc_21",
+    "price_to_sma_21",
+    "price_to_sma_50",
+    "price_to_sma_200",
+    "macd_diff",
+    "rsi_14_norm",
+    "bb_pct_20",
+    "bb_width_20",
+    "price_position_63",
+    "close_position",
+    "realized_vol_5d",
+    "realized_vol_21d",
+    "realized_vol_63d",
+    "vol_ratio_5_21",
+    "vol_ratio_21_63",
+    "atr_14_norm",
+    "parkinson_vol_21d",
+    "vol_surprise",
+    "rel_volume_5",
+    "rel_volume_21",
+    "obv_signal",
+    "cmf",
+    "price_to_vwap",
+    "pv_corr_10",
+    "curve_slope_1_3m",
+    "curve_slope_3_12m",
+    "carry_signal_21d",
+    "roll_period",
+    "month_sin",
+    "month_cos",
+    "quarter_sin",
+    "quarter_cos",
+    "avg_cross_corr_21d",
+    "avg_cross_corr_63d",
+    "days_to_eia_norm",
+    "eia_report_day",
+    "days_to_opec_norm",
+    "opec_meeting_week",
+    "days_to_fomc_norm",
+    "fomc_meeting_week",
+    "event_pressure",
+    "regime_vol",
+    "regime_trend",
+    "regime_momentum",
+    "regime_curve"
+  ],
+  "n_features": 47,
+  "feature_groups": {
+    "price": 12,
+    "volatility": 8,
+    "volume": 6,
+    "curve": 8,
+    "cross_commodity": 2,
+    "calendar": 7,
+    "regime": 4
+  },
+  "regime_features": [
+    "regime_vol",
+    "regime_trend",
+    "regime_momentum",
+    "regime_curve"
+  ],
+  "warmup_days": 252,
+  "lookback_window": 60,
+  "input_shape": [
+    60,
+    47
+  ]
+}
