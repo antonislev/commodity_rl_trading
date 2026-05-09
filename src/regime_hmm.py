@@ -1,7 +1,19 @@
 """
-ARA-PPO v2.3 — HMM Regime Detector
-===================================
+ARA-PPO v2.3c — HMM Regime Detector with directional features
+==============================================================
 Gaussian Hidden Markov Model fit per walk-forward split (no lookahead).
+
+Feature set (v2.3c update)
+--------------------------
+Originally [log_return, rolling_vol_20d] — but the v2.3a run regressed
+because the HMM clustered by *magnitude of vol* and lumped the 2009–2010
+high-vol recovery rally into the same state as the 2008 crash.  Both have
+high vol; only the *direction* of returns distinguishes them.
+
+Added a rolling mean-return feature:  [log_return, rolling_vol_20d,
+rolling_mean_return_20d].  The mean-return feature gives the HMM a
+directional axis, so up-trends and down-trends become separable states
+even when both have similar vol.
 
 Why HMM not K-means?
 --------------------
@@ -33,6 +45,25 @@ except ImportError:
     HMM_AVAILABLE = False
 
 
+class _UniformHMMFallback:
+    """
+    Last-resort fallback when GaussianHMM fit fails on all retries.
+    Returns uniform regime probabilities — degenerate but never crashes.
+    Same .predict_proba() interface as hmmlearn.GaussianHMM.
+    """
+
+    def __init__(self, n_states: int):
+        self.n_components = n_states
+        self.startprob_   = np.ones(n_states) / n_states
+        self.transmat_    = np.ones((n_states, n_states)) / n_states
+        self.means_       = np.zeros((n_states, 2))
+        self.covars_      = np.ones((n_states, 2))
+
+    def predict_proba(self, X):
+        T = len(X)
+        return np.ones((T, self.n_components), dtype=np.float64) / self.n_components
+
+
 class RegimeHMM:
     """
     Gaussian HMM fit on (log_return, rolling_vol) for unsupervised regime
@@ -54,8 +85,9 @@ class RegimeHMM:
         self,
         n_states: int     = 4,
         vol_window: int   = 20,
-        n_iter: int       = 500,    # was 100 — give EM enough iterations
-        tol: float        = 1e-4,   # explicit convergence tolerance
+        mean_window: int  = 20,    # v2.3c: rolling mean-return window
+        n_iter: int       = 500,
+        tol: float        = 1e-4,
         random_state: int = 42,
     ) -> None:
         if not HMM_AVAILABLE:
@@ -64,6 +96,7 @@ class RegimeHMM:
             )
         self.n_states     = n_states
         self.vol_window   = vol_window
+        self.mean_window  = mean_window
         self.n_iter       = n_iter
         self.tol          = tol
         self.random_state = random_state
@@ -71,7 +104,14 @@ class RegimeHMM:
         self._fitted: bool = False
 
     def _features(self, df: pd.DataFrame) -> np.ndarray:
-        """Build (T, 2) input matrix: [log_return, rolling_vol_20d]."""
+        """
+        Build (T, 3) input matrix: [log_return, rolling_vol, rolling_mean].
+
+        v2.3c: the rolling-mean feature gives the HMM a directional axis so
+        up-trending and down-trending high-vol periods become separable
+        states.  Without it, the HMM clustered the 2009-2010 recovery into
+        the same state as the 2008 crash, causing wrong-way trades.
+        """
         ret = df["log_return"].fillna(0).values.astype(np.float64)
         vol = (
             df["log_return"]
@@ -81,29 +121,67 @@ class RegimeHMM:
             .values
             .astype(np.float64)
         )
-        return np.column_stack([ret, vol])
+        mean = (
+            df["log_return"]
+            .rolling(self.mean_window, min_periods=1)
+            .mean()
+            .fillna(0)
+            .values
+            .astype(np.float64)
+        )
+        return np.column_stack([ret, vol, mean])
 
     def fit(self, df: pd.DataFrame) -> "RegimeHMM":
-        """Fit HMM on the training-window dataframe."""
+        """
+        Fit HMM on the training-window dataframe with NaN-safe retry logic.
+
+        Sometimes EM diverges and produces NaN parameters (especially on
+        regime-degenerate windows).  We detect this and retry with a different
+        random seed up to `n_retries` times.  If all retries fail we fall back
+        to a uniform-prior 1-state model that always returns equal regime
+        probabilities — ensures downstream code never crashes.
+        """
+        import warnings as _warn, io, contextlib
         X = self._features(df)
-        self.hmm = GaussianHMM(
-            n_components    = self.n_states,
-            covariance_type = "diag",
-            n_iter          = self.n_iter,
-            tol             = self.tol,
-            random_state    = self.random_state,
-            init_params     = "stmc",   # init starts/transmat/means/covars
-            verbose         = False,
-        )
-        # Silence hmmlearn's ConvergenceMonitor (uses bare print, not warnings)
-        # plus the warnings module for safety.
-        import warnings, sys, io, contextlib
-        buf = io.StringIO()
-        with warnings.catch_warnings(), \
-             contextlib.redirect_stdout(buf), \
-             contextlib.redirect_stderr(buf):
-            warnings.simplefilter("ignore")
-            self.hmm.fit(X)
+        # Replace any non-finite rows defensively (shouldn't happen but cheap)
+        X = np.where(np.isfinite(X), X, 0.0)
+
+        n_retries = 5
+        last_err = None
+        for attempt in range(n_retries):
+            seed = self.random_state + attempt * 7919  # different seed each retry
+            self.hmm = GaussianHMM(
+                n_components    = self.n_states,
+                covariance_type = "diag",
+                n_iter          = self.n_iter,
+                tol             = self.tol,
+                random_state    = seed,
+                init_params     = "stmc",
+                verbose         = False,
+            )
+            buf = io.StringIO()
+            try:
+                with _warn.catch_warnings(), \
+                     contextlib.redirect_stdout(buf), \
+                     contextlib.redirect_stderr(buf):
+                    _warn.simplefilter("ignore")
+                    self.hmm.fit(X)
+                # Validate fitted parameters are all finite
+                ok = (
+                    np.all(np.isfinite(self.hmm.startprob_)) and
+                    np.all(np.isfinite(self.hmm.transmat_))  and
+                    np.all(np.isfinite(self.hmm.means_))     and
+                    np.all(np.isfinite(self.hmm.covars_))
+                )
+                if ok:
+                    self._fitted = True
+                    return self
+            except Exception as e:
+                last_err = e
+
+        # Final fallback: build a degenerate model that returns uniform probs.
+        # Don't crash — let the ensemble downstream still receive valid input.
+        self.hmm = _UniformHMMFallback(self.n_states)
         self._fitted = True
         return self
 

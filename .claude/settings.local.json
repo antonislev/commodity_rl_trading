@@ -24,7 +24,9 @@
       "Bash(\"C:\\\\\\\\Python313\\\\\\\\python.exe\" -m pip install hmmlearn)",
       "Bash(\"C:\\\\\\\\Python313\\\\\\\\python.exe\")",
       "Bash('C:\\\\Python313\\\\python.exe' -c ' *)",
-      "Bash(\"C:\\\\Python313\\\\python.exe\")"
+      "Bash(\"C:\\\\Python313\\\\python.exe\")",
+      "Bash(\"C:\\\\Python313\\\\python.exe\" -m pip install xgboost arch)",
+      "Bash(\"C:\\\\Python313\\\\python.exe\" -c \"import xgboost, arch; print\\('xgb', xgboost.__version__, ' arch', arch.__version__\\)\")"
     ]
   }
 }

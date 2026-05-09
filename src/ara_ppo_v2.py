@@ -290,12 +290,15 @@ class HybridMoEActionNet(nn.Module):
         expert_hidden: int = 32,
         action_dim: int    = 1,         # kept for API compat; only 1 supported
         gumbel_tau: float  = 1.0,
+        # v2.4 Option A: FiLM-style regime conditioning
+        use_regime_modulation: bool = False,
     ) -> None:
         super().__init__()
-        self.cnn_out      = cnn_out
-        self.n_regime     = n_regime
-        self.n_experts    = n_experts
-        self.gumbel_tau   = gumbel_tau
+        self.cnn_out               = cnn_out
+        self.n_regime              = n_regime
+        self.n_experts             = n_experts
+        self.gumbel_tau            = gumbel_tau
+        self.use_regime_modulation = use_regime_modulation
 
         # Expert feature encoders (no final action logit — they produce features)
         # Each: Linear(64→32)→ReLU  — experts specialise their 32-dim features
@@ -314,6 +317,22 @@ class HybridMoEActionNet(nn.Module):
         # Learnable softmax temperature (init 1.0, clamped ≥ 0.1)
         self.tau = nn.Parameter(th.ones(1))
 
+        # ── v2.4 Option A: regime-conditioned action head (FiLM gating) ──────
+        # Multiplicative gating modulates the blended expert features per regime,
+        # so the gate/size heads compute a different function in different
+        # regimes — addresses the "HMM-as-features insufficient" failure of v2.3.
+        # Reference: Perez et al. 2018, "FiLM: Visual Reasoning with a General
+        # Conditioning Layer" (AAAI 2018).
+        if self.use_regime_modulation:
+            # Linear(n_regime → expert_hidden) + Tanh → bounded modulation [-1,+1]
+            # Final scale = 1 + tanh ∈ [0, 2], stable
+            self.regime_modulator = nn.Sequential(
+                nn.Linear(n_regime, expert_hidden),
+                nn.Tanh(),
+            )
+        else:
+            self.regime_modulator = None
+
         # Gate head: blended expert features → P(long, short, flat)
         self.gate = nn.Linear(expert_hidden, 3)
 
@@ -328,6 +347,8 @@ class HybridMoEActionNet(nn.Module):
         self._last_weights: Optional[np.ndarray]       = None  # detached, numpy
         self._gate_probs_grad: Optional[th.Tensor]     = None  # graph attached
         self._last_gate_probs: Optional[np.ndarray]    = None  # detached, numpy
+        # v2.4: monitor regime modulation magnitude
+        self._last_modulation_norm: Optional[float]    = None
 
     def forward(self, latent: th.Tensor) -> th.Tensor:
         """
@@ -352,6 +373,18 @@ class HybridMoEActionNet(nn.Module):
 
         # ── Blended expert features ───────────────────────────────────────────
         blended = (expert_feats * weights.unsqueeze(-1)).sum(dim=1)  # (B, 32)
+
+        # ── v2.4 Option A: FiLM-style regime modulation ─────────────────────
+        # Multiplicatively re-scale the blended features by a regime-specific
+        # vector.  When regime probs change, the SCALE of every dimension of
+        # `blended` changes — so gate/size effectively compute a different
+        # function per regime, not just respond to a different input.
+        #   modulation ∈ [-1, +1]^expert_hidden via Tanh
+        #   gated      = blended * (1 + modulation)  ∈ [0, 2] × blended
+        if self.use_regime_modulation and self.regime_modulator is not None:
+            modulation = self.regime_modulator(regime)         # (B, expert_hidden)
+            blended = blended * (1.0 + modulation)              # (B, expert_hidden)
+            self._last_modulation_norm = float(modulation.detach().abs().mean().item())
 
         # ── Gate: direction decision ──────────────────────────────────────────
         gate_logits = self.gate(blended)                 # (B, 3)
@@ -462,15 +495,18 @@ class MoEActorCriticPolicy(ActorCriticPolicy):
         router_ent_coef: float = 0.1,
         # Gate entropy bonus — encourages using the flat option
         gate_ent_coef: float   = 0.05,
+        # v2.4 Option A: FiLM regime modulation
+        use_regime_modulation: bool = False,
         **kwargs: Any,
     ) -> None:
         # Store before super().__init__ because _build() is called inside it
-        self._n_experts       = n_experts
-        self._expert_hidden   = expert_hidden
-        self._cnn_out         = cnn_out
-        self._n_regime        = n_regime
-        self._router_ent_coef = router_ent_coef
-        self._gate_ent_coef   = gate_ent_coef
+        self._n_experts             = n_experts
+        self._expert_hidden         = expert_hidden
+        self._cnn_out               = cnn_out
+        self._n_regime              = n_regime
+        self._router_ent_coef       = router_ent_coef
+        self._gate_ent_coef         = gate_ent_coef
+        self._use_regime_modulation = use_regime_modulation
 
         # Force pass-through MLP extractor (net_arch=[]) and our CNN extractor
         kwargs["net_arch"] = []
@@ -499,13 +535,14 @@ class MoEActorCriticPolicy(ActorCriticPolicy):
             th.ones(action_dim) * self.log_std_init, requires_grad=True
         )
 
-        # 4. Hybrid MoE actor head (gate + size, v2.2)
+        # 4. Hybrid MoE actor head (gate + size, v2.2; FiLM gating, v2.4)
         self.action_net = HybridMoEActionNet(
-            cnn_out       = self._cnn_out,
-            n_regime      = self._n_regime,
-            n_experts     = self._n_experts,
-            expert_hidden = self._expert_hidden,
-            action_dim    = action_dim,
+            cnn_out               = self._cnn_out,
+            n_regime              = self._n_regime,
+            n_experts             = self._n_experts,
+            expert_hidden         = self._expert_hidden,
+            action_dim            = action_dim,
+            use_regime_modulation = self._use_regime_modulation,
         )
 
         # 5. Regime-aware critic
@@ -607,6 +644,16 @@ class MoEActorCriticPolicy(ActorCriticPolicy):
         if (hasattr(self.action_net, '_last_gate_probs')
                 and self.action_net._last_gate_probs is not None):
             return self.action_net._last_gate_probs.mean(axis=0)
+        return None
+
+    @property
+    def last_modulation_norm(self) -> Optional[float]:
+        """v2.4: |regime modulation| averaged over batch & feature dims.
+        Useful diagnostic — if this stays near 0, the regime modulator
+        learned to ignore regime info (degenerate to baseline architecture).
+        Healthy values: 0.1–0.6."""
+        if hasattr(self.action_net, '_last_modulation_norm'):
+            return self.action_net._last_modulation_norm
         return None
 
 
@@ -831,6 +878,7 @@ def make_moe_ppo(
     expert_hidden: int             = 32,
     router_ent_coef: float         = 0.1,
     gate_ent_coef: float           = 0.05,   # encourages flat option usage
+    use_regime_modulation: bool    = False,  # v2.4 Option A: FiLM regime gating
     downside_penalty: float        = 2.0,
     crisis_oversample: float       = 3.0,
     use_asymmetric_reward: bool    = True,
@@ -883,11 +931,12 @@ def make_moe_ppo(
         )
 
     policy_kwargs: Dict[str, Any] = dict(
-        n_experts       = n_experts,
-        expert_hidden   = expert_hidden,
-        router_ent_coef = router_ent_coef,
-        gate_ent_coef   = gate_ent_coef,
-        n_features      = _n_features_actual,   # Fix 2: 47 default, 51 with HMM
+        n_experts             = n_experts,
+        expert_hidden         = expert_hidden,
+        router_ent_coef       = router_ent_coef,
+        gate_ent_coef         = gate_ent_coef,
+        n_features            = _n_features_actual,   # Fix 2: 47 default, 51 with HMM
+        use_regime_modulation = use_regime_modulation, # v2.4 Option A
     )
 
     buffer_kwargs: Dict[str, Any] = {}
