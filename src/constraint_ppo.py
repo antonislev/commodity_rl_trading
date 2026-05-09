@@ -191,7 +191,7 @@ class HybridForecastEnv(gym.Env):
 
 class ConstraintAwareActionNet(nn.Module):
     """
-    Compact action head with Kelly-fraction constraint.
+    Compact action head with fractional-Kelly constraint (Thorp 1969 form).
 
     Architecture
     ------------
@@ -199,29 +199,40 @@ class ConstraintAwareActionNet(nn.Module):
       direction head :  Tanh — outputs ∈ [-1, +1]
       magnitude head :  Sigmoid — outputs ∈ [0, 1]
 
-    Final action = direction × magnitude × kelly_fraction(state)
+    Final action  =  direction × magnitude × kelly(state)
 
-      kelly_fraction = clip( |μ / σ²|, 0, kelly_cap )
+      kelly = clamp( kelly_fraction × |μ / σ²|, 0, 1.0 )
 
-    The state's first two entries are (μ, σ).  This is a HARD constraint —
-    the policy literally cannot output a position larger than the Kelly cap
-    because the action is computed as direction × bounded_magnitude.
+    where `kelly_fraction` is the Thorp-style fractional-Kelly multiplier
+    (1.0 = full Kelly, 0.5 = half-Kelly, etc.) and the final clamp at 1.0
+    enforces 100%-of-bankroll as the absolute leverage ceiling.
+
+    Why fraction-then-clip, not flat cap?
+    -------------------------------------
+    The previous formulation ``kelly = clamp(|μ/σ²|, 0, cap)`` treated
+    ``cap`` as a hard ceiling.  When ``cap = 0.5`` and the Kelly
+    recommendation is 1.6 (typical for confident forecasts), the action was
+    crushed to 0.5 — eliminating the upside that would offset transaction
+    costs.  PPO then learned a degenerate "don't trade" policy.
+
+    The new form scales the Kelly recommendation by ``kelly_fraction`` and
+    only clips at 100% leverage.  At ``kelly_fraction=0.5`` and Kelly=1.6,
+    we get kelly=0.8 (still ample headroom for upside), while weak
+    forecasts (Kelly=0.4) give kelly=0.2 (correctly attenuated).
 
     Reference
     ---------
-    Kelly (1956) "A New Interpretation of Information Rate".  For a single
-    risky asset f* = μ/σ² is the growth-optimal position.  Half-Kelly
-    (kelly_cap = 0.5) is the conservative practitioner default.
+    Kelly (1956); Thorp (1969) "Optimal Gambling Systems for Favorable Games".
     """
 
     def __init__(
         self,
         state_dim: int,
-        hidden: int      = 64,
-        kelly_cap: float = 1.0,
+        hidden: int             = 64,
+        kelly_fraction: float   = 0.5,    # 1.0 = full Kelly, 0.5 = half-Kelly
     ) -> None:
         super().__init__()
-        self.kelly_cap = kelly_cap
+        self.kelly_fraction = kelly_fraction
         self.trunk = nn.Sequential(
             nn.Linear(state_dim, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden), nn.ReLU(),
@@ -241,7 +252,8 @@ class ConstraintAwareActionNet(nn.Module):
 
         mu  = state[:, 0:1]
         sig = state[:, 1:2].clamp(min=1e-6)
-        kelly = (mu / (sig**2)).abs().clamp(0.0, self.kelly_cap)  # (B, 1)
+        kelly_optimal = (mu / (sig**2)).abs()                     # (B, 1)
+        kelly = (self.kelly_fraction * kelly_optimal).clamp(0.0, 1.0)
 
         action = direction * magnitude * kelly  # (B, 1)
 
@@ -265,8 +277,9 @@ class CompactConstraintPolicy(ActorCriticPolicy):
       - log_std floor at -1.0 (carried over from v2)
 
     Constructor kwargs (beyond standard SB3):
-      hidden     int   64
-      kelly_cap  float 1.0   max Kelly fraction (1.0 = full Kelly, 0.5 = half)
+      hidden          int   64
+      kelly_fraction  float 0.5   fractional-Kelly multiplier (Thorp 1969 form);
+                                  1.0 = full Kelly, 0.5 = half-Kelly
     """
 
     def __init__(
@@ -274,12 +287,12 @@ class CompactConstraintPolicy(ActorCriticPolicy):
         observation_space: spaces.Space,
         action_space: spaces.Space,
         lr_schedule: Schedule,
-        hidden: int      = 64,
-        kelly_cap: float = 1.0,
+        hidden: int            = 64,
+        kelly_fraction: float  = 0.5,
         **kwargs,
     ) -> None:
-        self._hidden    = hidden
-        self._kelly_cap = kelly_cap
+        self._hidden         = hidden
+        self._kelly_fraction = kelly_fraction
         kwargs["net_arch"] = []  # we build our own
         super().__init__(observation_space, action_space, lr_schedule, **kwargs)
 
@@ -296,7 +309,7 @@ class CompactConstraintPolicy(ActorCriticPolicy):
         self.action_net = ConstraintAwareActionNet(
             state_dim=state_dim,
             hidden=self._hidden,
-            kelly_cap=self._kelly_cap,
+            kelly_fraction=self._kelly_fraction,
         )
 
         # Compact value head
@@ -339,7 +352,7 @@ def make_compact_ppo(
     max_grad_norm: float   = 0.5,
     ent_coef: float        = 0.01,
     hidden: int            = 64,
-    kelly_cap: float       = 1.0,
+    kelly_fraction: float  = 0.5,
     device: str            = "auto",
     seed: int              = 42,
     verbose: int           = 0,
@@ -348,20 +361,19 @@ def make_compact_ppo(
     Build a PPO model with the CompactConstraintPolicy on a compact state
     space.  Designed for the HybridForecastEnv.
 
+    `kelly_fraction` is the Thorp-style fractional-Kelly multiplier:
+      1.0  full Kelly    — aggressive, can over-leverage on noisy forecasts
+      0.5  half-Kelly    — practitioner default, balanced
+      0.25 quarter-Kelly — defensive
+
     Default hyperparameters reflect the much smaller policy (~5-10k params)
     and the better signal-to-noise ratio:
       - higher LR than v2 (3e-4 vs 3e-6) — small net, less overfitting risk
       - vanilla PPO defaults (no MoE, no router entropy bonus)
-
-    Example
-    -------
-        env_hybrid = HybridForecastEnv(base_env, fc_mus, fc_sigs, rp, ensemble)
-        model = make_compact_ppo(env_hybrid, total_timesteps=200_000)
-        model.learn(total_timesteps=200_000)
     """
     policy_kwargs: Dict[str, Any] = dict(
-        hidden    = hidden,
-        kelly_cap = kelly_cap,
+        hidden         = hidden,
+        kelly_fraction = kelly_fraction,
     )
     return PPO(
         policy        = CompactConstraintPolicy,
