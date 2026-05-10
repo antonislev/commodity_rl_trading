@@ -93,6 +93,26 @@ class HybridForecastEnv(gym.Env):
         forecast_sigmas: np.ndarray,
         regime_probs:    np.ndarray,
         ensemble,
+        # v3.1 risk-aware parameters
+        sigma_garch_idx:    int          = -1,
+        sigma_train_floor:  float        = 0.0,
+        target_vol:         Optional[float] = None,
+        vol_window:         int          = 20,
+        vol_scaler_min:     float        = 0.3,
+        vol_scaler_max:     float        = 1.5,
+        # v3.2 OOD + forecast-quality feedback
+        use_ood_attenuation: bool        = False,
+        ood_threshold:       float       = 0.02,    # legacy; preferred is ood_p90 below
+        ood_p90:             Optional[float] = None, # v3.3: 90th-percentile training disagreement
+        ood_attenuation_alpha: float     = 0.5,
+        use_ewma_corr:       bool        = False,
+        ewma_window:         int         = 60,      # v3.3: longer window (was 20)
+        # v3.3 new features
+        use_autocorr_feature: bool       = False,
+        autocorr_window:      int        = 20,
+        use_disagreement_in_sigma: bool  = False,
+        use_rolling_vol_in_sigma:  bool  = False,
+        rolling_vol_window:        int    = 20,
     ) -> None:
         super().__init__()
         self.base_env = base_env
@@ -100,6 +120,30 @@ class HybridForecastEnv(gym.Env):
         self.forecast_sigmas = forecast_sigmas.astype(np.float32)
         self.regime_probs    = regime_probs.astype(np.float32)
         self.ensemble        = ensemble
+
+        # v3.1 — σ safety params
+        self.sigma_garch_idx    = int(sigma_garch_idx)
+        self.sigma_train_floor  = float(sigma_train_floor)
+        # v3.1 — vol-targeting params
+        self.target_vol         = float(target_vol) if target_vol is not None else None
+        self.vol_window         = int(vol_window)
+        self.vol_scaler_min     = float(vol_scaler_min)
+        self.vol_scaler_max     = float(vol_scaler_max)
+        # v3.2 / v3.3 — OOD + EWMA correlation params
+        self.use_ood_attenuation   = bool(use_ood_attenuation)
+        self.ood_threshold         = float(ood_threshold)
+        self.ood_p90               = ood_p90    # if set, used in preference to ood_threshold
+        self.ood_attenuation_alpha = float(ood_attenuation_alpha)
+        self.use_ewma_corr         = bool(use_ewma_corr)
+        self.ewma_window           = int(ewma_window)
+        self._ewma_alpha           = 2.0 / (max(self.ewma_window, 2) + 1)
+
+        # v3.3 — new features
+        self.use_autocorr_feature       = bool(use_autocorr_feature)
+        self.autocorr_window            = int(autocorr_window)
+        self.use_disagreement_in_sigma  = bool(use_disagreement_in_sigma)
+        self.use_rolling_vol_in_sigma   = bool(use_rolling_vol_in_sigma)
+        self.rolling_vol_window         = int(rolling_vol_window)
 
         # Pre-compute ensemble forecasts for all timesteps
         self._ensemble_pred = ensemble.predict(
@@ -113,25 +157,161 @@ class HybridForecastEnv(gym.Env):
             )
 
         n_regimes = self.regime_probs.shape[1]
-        self._obs_dim = 3 + n_regimes + 5  # μ, σ, sharpe, R regimes, 5 portfolio
+        # v3.3 obs layout (extras placed before regime, in this fixed order):
+        #   ood, recent_corr (reliability), autocorr
+        self._n_extra = (
+            (1 if self.use_ood_attenuation else 0)
+            + (1 if self.use_ewma_corr else 0)
+            + (1 if self.use_autocorr_feature else 0)
+        )
+        self._obs_dim = 3 + self._n_extra + n_regimes + 5
         self.observation_space = spaces.Box(
             low=-10.0, high=10.0, shape=(self._obs_dim,), dtype=np.float32,
         )
         self.action_space = base_env.action_space
 
+        # v3.1 — diagnostics
+        self._last_sigma_eff:    Optional[float] = None
+        self._last_vol_scaler:   Optional[float] = None
+        self._last_kelly_frac:   Optional[float] = None
+        # v3.2 — diagnostics + EWMA state
+        self._last_ood_score:    Optional[float] = None
+        self._last_recent_corr:  Optional[float] = None
+        self._last_autocorr:     Optional[float] = None
+        self._reset_ewma_state()
+        self._pending_pred_mu:   Optional[float] = None
+
+    def _reset_ewma_state(self) -> None:
+        self._ewma_mu  = 0.0
+        self._ewma_r   = 0.0
+        self._ewma_mu2 = 0.0
+        self._ewma_r2  = 0.0
+        self._ewma_mur = 0.0
+        self._ewma_count = 0
+
+    def _update_ewma(self, mu: float, r: float) -> None:
+        a = self._ewma_alpha
+        self._ewma_mu  = a * mu      + (1 - a) * self._ewma_mu
+        self._ewma_r   = a * r       + (1 - a) * self._ewma_r
+        self._ewma_mu2 = a * mu * mu + (1 - a) * self._ewma_mu2
+        self._ewma_r2  = a * r  * r  + (1 - a) * self._ewma_r2
+        self._ewma_mur = a * mu * r  + (1 - a) * self._ewma_mur
+        self._ewma_count += 1
+
+    def _ewma_correlation(self) -> float:
+        if self._ewma_count < 5:
+            return 0.0
+        var_mu = self._ewma_mu2 - self._ewma_mu ** 2
+        var_r  = self._ewma_r2  - self._ewma_r ** 2
+        if var_mu <= 1e-10 or var_r <= 1e-10:
+            return 0.0
+        cov = self._ewma_mur - self._ewma_mu * self._ewma_r
+        c = cov / (np.sqrt(var_mu * var_r) + 1e-10)
+        return float(np.clip(c, -1.0, 1.0))
+
+    def _compute_ood_score(self, idx: int) -> float:
+        """
+        v3.3 OOD: composite score from forecaster disagreement + reliability decay.
+
+          ood_disagreement = sigmoid((d - p90) / p90)   sharp activation above 90th-pct
+          ood_reliability  = max(0, -recent_corr)        positive when forecasts wrong-direction
+          ood = 0.6 * disagreement + 0.4 * reliability
+
+        With ood_p90 set, the disagreement component only fires when disagreement
+        exceeds the 90th percentile of training-set disagreement — addressing
+        the v3.2 bug where OOD fired constantly.
+        """
+        mus_t = self.forecast_mus[idx]
+        disagreement = float(np.std(mus_t))
+
+        if self.ood_p90 is not None and self.ood_p90 > 0:
+            # Sigmoid centred at p90 — fires sharply only on outlier disagreement
+            x = (disagreement - self.ood_p90) / max(self.ood_p90, 1e-6)
+            ood_dis = float(1.0 / (1.0 + np.exp(-3.0 * x)))   # logistic
+        else:
+            # Legacy fallback
+            ood_dis = float(1.0 - np.exp(-disagreement / max(self.ood_threshold, 1e-6)))
+
+        # Reliability component: when EWMA corr goes negative, forecasts are
+        # systematically wrong-direction → treat as OOD-like signal
+        if self.use_ewma_corr:
+            recent_corr = self._ewma_correlation()
+            ood_rel = max(0.0, -recent_corr)                  # in [0, 1]
+        else:
+            ood_rel = 0.0
+
+        return float(np.clip(0.6 * ood_dis + 0.4 * ood_rel, 0.0, 1.0))
+
+    def _compute_autocorr(self) -> float:
+        """v3.3 chop detector: lag-1 autocorrelation of recent realised returns.
+        Positive autocorr = trending; near zero or negative = choppy/mean-reverting."""
+        env = self.base_env
+        idx = env.start_idx + env.lookback + env.current_step
+        # Use realised market returns history (from env's return_arr)
+        lo = max(0, idx - self.autocorr_window)
+        rets = env.return_arr[lo:idx]
+        if len(rets) < 5:
+            return 0.0
+        try:
+            r = np.asarray(rets, dtype=np.float64)
+            r1 = r[1:]
+            r0 = r[:-1]
+            if r1.std() < 1e-8 or r0.std() < 1e-8:
+                return 0.0
+            corr = float(np.corrcoef(r0, r1)[0, 1])
+            if not np.isfinite(corr):
+                return 0.0
+            return float(np.clip(corr, -1.0, 1.0))
+        except Exception:
+            return 0.0
+
+    def _rolling_realised_vol(self) -> float:
+        """v3.3 σ floor from recent realised market vol (annualised)."""
+        env = self.base_env
+        idx = env.start_idx + env.lookback + env.current_step
+        lo = max(0, idx - self.rolling_vol_window)
+        rets = env.return_arr[lo:idx]
+        if len(rets) < 5:
+            return 0.0
+        v = float(np.std(rets) * np.sqrt(252))
+        # Convert annualised back to daily-scale σ
+        return v / np.sqrt(252)
+
     # ── Compact observation builder ───────────────────────────────────────────
 
     def _compact_obs(self) -> np.ndarray:
-        # Index into the precomputed forecasts at the current time
         idx = self.base_env.start_idx + self.base_env.lookback + self.base_env.current_step
         idx = min(idx, len(self._ensemble_pred) - 1)
 
-        mu  = float(self._ensemble_pred[idx, 0])
-        sig = float(max(self._ensemble_pred[idx, 1], 1e-6))
-        sharpe = float(np.clip(mu / sig, -5.0, 5.0))
+        mu      = float(self._ensemble_pred[idx, 0])
+        sig_ens = float(max(self._ensemble_pred[idx, 1], 1e-6))
+
+        # ── v3.3 σ_final = max(σ_ens, σ_garch, σ_train_floor, disagreement, rolling_vol) ──
+        sig_eff = sig_ens
+        if 0 <= self.sigma_garch_idx < self.forecast_sigmas.shape[1]:
+            sig_garch = float(self.forecast_sigmas[idx, self.sigma_garch_idx])
+            if sig_garch > 0 and np.isfinite(sig_garch):
+                sig_eff = max(sig_eff, sig_garch)
+        if self.sigma_train_floor > 0:
+            sig_eff = max(sig_eff, self.sigma_train_floor)
+        # v3.3 new components
+        if self.use_disagreement_in_sigma:
+            disagreement = float(np.std(self.forecast_mus[idx]))
+            sig_eff = max(sig_eff, disagreement)
+        if self.use_rolling_vol_in_sigma:
+            sig_eff = max(sig_eff, self._rolling_realised_vol())
+
+        self._last_sigma_eff = sig_eff
+        sharpe = float(np.clip(mu / sig_eff, -5.0, 5.0))
         regime = self.regime_probs[idx]                       # (R,)
 
-        # Portfolio state (mirror the last 5 entries of base env's obs)
+        ood_score   = self._compute_ood_score(idx) if self.use_ood_attenuation else 0.0
+        recent_corr = self._ewma_correlation() if self.use_ewma_corr else 0.0
+        autocorr    = self._compute_autocorr() if self.use_autocorr_feature else 0.0
+        self._last_ood_score   = ood_score
+        self._last_recent_corr = recent_corr
+        self._last_autocorr    = autocorr
+
         env = self.base_env
         peak = max(env.peak_value, 1e-9)
         drawdown = env.portfolio_value / peak - 1.0 if peak > 0 else 0.0
@@ -144,21 +324,70 @@ class HybridForecastEnv(gym.Env):
             np.clip(env.total_costs / env.config["initial_capital"], 0, 0.1),
         ], dtype=np.float32)
 
-        obs = np.concatenate([
-            np.array([mu, sig, sharpe], dtype=np.float32),
+        self._pending_pred_mu = mu
+
+        # Build obs in fixed order: [μ, σ_eff, sharpe, (ood?), (corr?), (autocorr?), regime, portfolio]
+        head = [mu, sig_eff, sharpe]
+        if self.use_ood_attenuation:
+            head.append(ood_score)
+        if self.use_ewma_corr:
+            head.append(recent_corr)
+        if self.use_autocorr_feature:
+            head.append(autocorr)
+
+        return np.concatenate([
+            np.array(head, dtype=np.float32),
             regime.astype(np.float32),
             portfolio,
         ])
-        return obs
 
     # ── gym API ───────────────────────────────────────────────────────────────
 
     def reset(self, seed=None, options=None):
         self.base_env.reset(seed=seed, options=options)
+        # Reset diagnostics + EWMA state per episode
+        self._last_vol_scaler = 1.0
+        self._last_ood_score  = 0.0
+        self._last_recent_corr = 0.0
+        self._reset_ewma_state()
+        self._pending_pred_mu = None
         return self._compact_obs(), self._info()
 
     def step(self, action):
+        action = np.asarray(action, dtype=np.float32).copy()
+
+        # ── v3.1 vol-targeting attenuation ──────────────────────────────────
+        if self.target_vol is not None:
+            rh = self.base_env.return_history
+            if len(rh) >= self.vol_window:
+                realized = float(np.std(rh[-self.vol_window:]) * np.sqrt(252))
+                realized = max(realized, 0.05)
+                scaler = float(np.clip(
+                    self.target_vol / realized,
+                    self.vol_scaler_min, self.vol_scaler_max,
+                ))
+                action *= scaler
+                self._last_vol_scaler = scaler
+            else:
+                self._last_vol_scaler = 1.0
+
+        # ── v3.2 OOD attenuation: shrink action when forecasters disagree ───
+        if self.use_ood_attenuation and self._last_ood_score is not None:
+            ood = self._last_ood_score
+            ood_mult = 1.0 - self.ood_attenuation_alpha * ood
+            action *= ood_mult
+
+        # Capture index BEFORE base step (current_step still points at "now")
+        idx_now = self.base_env.start_idx + self.base_env.lookback + self.base_env.current_step
+
         _, reward, terminated, truncated, info = self.base_env.step(action)
+
+        # ── v3.2 update EWMA correlation with (predicted_μ_now, realised_ret_now) ──
+        if self.use_ewma_corr and self._pending_pred_mu is not None:
+            if 0 <= idx_now < len(self.base_env.return_arr):
+                r_realised = float(self.base_env.return_arr[idx_now])
+                self._update_ewma(self._pending_pred_mu, r_realised)
+
         return self._compact_obs(), reward, terminated, truncated, info
 
     def _info(self) -> dict:
@@ -228,11 +457,33 @@ class ConstraintAwareActionNet(nn.Module):
     def __init__(
         self,
         state_dim: int,
-        hidden: int             = 64,
-        kelly_fraction: float   = 0.5,    # 1.0 = full Kelly, 0.5 = half-Kelly
+        hidden: int                                  = 64,
+        kelly_fraction: float                        = 0.5,
+        kelly_per_regime: Optional[np.ndarray]       = None,
+        regime_obs_offset: int                       = 3,
+        n_regimes: int                               = 4,
+        # v3.3
+        detach_kelly: bool                           = True,
     ) -> None:
         super().__init__()
-        self.kelly_fraction = kelly_fraction
+        self.kelly_fraction    = kelly_fraction
+        self.regime_obs_offset = int(regime_obs_offset)
+        self.n_regimes         = int(n_regimes)
+        self.detach_kelly      = bool(detach_kelly)
+
+        if kelly_per_regime is not None:
+            kpr = np.asarray(kelly_per_regime, dtype=np.float32)
+            if kpr.shape[0] != n_regimes:
+                raise ValueError(
+                    f"kelly_per_regime length {kpr.shape[0]} != n_regimes {n_regimes}"
+                )
+            # Register as buffer so .to(device) moves it correctly.
+            self.register_buffer("kelly_per_regime", th.from_numpy(kpr))
+            self._use_regime_kelly = True
+        else:
+            self.register_buffer("kelly_per_regime", th.zeros(n_regimes))
+            self._use_regime_kelly = False
+
         self.trunk = nn.Sequential(
             nn.Linear(state_dim, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden), nn.ReLU(),
@@ -241,9 +492,10 @@ class ConstraintAwareActionNet(nn.Module):
         self.mag_head = nn.Sequential(nn.Linear(hidden, 1), nn.Sigmoid())
 
         # Diagnostic state
-        self._last_kelly: Optional[np.ndarray]    = None
-        self._last_direction: Optional[np.ndarray] = None
-        self._last_magnitude: Optional[np.ndarray] = None
+        self._last_kelly: Optional[np.ndarray]      = None
+        self._last_direction: Optional[np.ndarray]  = None
+        self._last_magnitude: Optional[np.ndarray]  = None
+        self._last_kelly_frac: Optional[np.ndarray] = None
 
     def forward(self, state: th.Tensor) -> th.Tensor:
         h = self.trunk(state)
@@ -252,15 +504,32 @@ class ConstraintAwareActionNet(nn.Module):
 
         mu  = state[:, 0:1]
         sig = state[:, 1:2].clamp(min=1e-6)
-        kelly_optimal = (mu / (sig**2)).abs()                     # (B, 1)
-        kelly = (self.kelly_fraction * kelly_optimal).clamp(0.0, 1.0)
 
-        action = direction * magnitude * kelly  # (B, 1)
+        # v3.1/v3.3 — regime-weighted Kelly fraction (with per-regime hard caps)
+        if self._use_regime_kelly:
+            r = state[:, self.regime_obs_offset : self.regime_obs_offset + self.n_regimes]
+            r_norm = r / (r.sum(dim=-1, keepdim=True) + 1e-8)
+            kelly_frac = (r_norm * self.kelly_per_regime.unsqueeze(0)).sum(dim=-1, keepdim=True)
+        else:
+            kelly_frac = th.full_like(mu, self.kelly_fraction)
+
+        kelly_optimal = (mu / (sig**2)).abs()
+        kelly = (kelly_frac * kelly_optimal).clamp(0.0, 1.0)
+
+        # v3.3 — detach Kelly to prevent perverse gradient dynamics
+        # (rationale: PPO's gradients shouldn't be amplified on high-Kelly days)
+        if self.detach_kelly:
+            kelly_used = kelly.detach()
+        else:
+            kelly_used = kelly
+
+        action = direction * magnitude * kelly_used  # (B, 1)
 
         # Diagnostics
-        self._last_kelly     = kelly.detach().cpu().numpy()
-        self._last_direction = direction.detach().cpu().numpy()
-        self._last_magnitude = magnitude.detach().cpu().numpy()
+        self._last_kelly      = kelly.detach().cpu().numpy()
+        self._last_direction  = direction.detach().cpu().numpy()
+        self._last_magnitude  = magnitude.detach().cpu().numpy()
+        self._last_kelly_frac = kelly_frac.detach().cpu().numpy()
 
         return action.clamp(-1.0, 1.0)
 
@@ -287,13 +556,21 @@ class CompactConstraintPolicy(ActorCriticPolicy):
         observation_space: spaces.Space,
         action_space: spaces.Space,
         lr_schedule: Schedule,
-        hidden: int            = 64,
-        kelly_fraction: float  = 0.5,
+        hidden: int                                = 64,
+        kelly_fraction: float                      = 0.5,
+        kelly_per_regime: Optional[np.ndarray]     = None,
+        n_regimes: int                             = 4,
+        regime_obs_offset: int                     = 3,
+        detach_kelly: bool                         = True,   # v3.3
         **kwargs,
     ) -> None:
-        self._hidden         = hidden
-        self._kelly_fraction = kelly_fraction
-        kwargs["net_arch"] = []  # we build our own
+        self._hidden              = hidden
+        self._kelly_fraction      = kelly_fraction
+        self._kelly_per_regime    = kelly_per_regime
+        self._n_regimes           = n_regimes
+        self._regime_obs_offset   = regime_obs_offset
+        self._detach_kelly        = detach_kelly
+        kwargs["net_arch"] = []
         super().__init__(observation_space, action_space, lr_schedule, **kwargs)
 
     def _build(self, lr_schedule: Schedule) -> None:
@@ -307,9 +584,13 @@ class CompactConstraintPolicy(ActorCriticPolicy):
 
         state_dim = int(self.observation_space.shape[0])
         self.action_net = ConstraintAwareActionNet(
-            state_dim=state_dim,
-            hidden=self._hidden,
-            kelly_fraction=self._kelly_fraction,
+            state_dim        = state_dim,
+            hidden           = self._hidden,
+            kelly_fraction   = self._kelly_fraction,
+            kelly_per_regime = self._kelly_per_regime,
+            n_regimes        = self._n_regimes,
+            regime_obs_offset= self._regime_obs_offset,
+            detach_kelly     = self._detach_kelly,
         )
 
         # Compact value head
@@ -325,7 +606,9 @@ class CompactConstraintPolicy(ActorCriticPolicy):
 
     def _get_action_dist_from_latent(self, latent_pi: th.Tensor):
         mean_actions = self.action_net(latent_pi)
-        log_std_floored = th.clamp(self.log_std, min=-1.0)
+        # v3.3: tighter floor (−1.5) so exploration noise doesn't dominate the
+        # signal.  σ_exploration = exp(-1.5) ≈ 0.22 (was 0.37 at floor=-1.0)
+        log_std_floored = th.clamp(self.log_std, min=-1.5)
         return self.action_dist.proba_distribution(mean_actions, log_std_floored)
 
     @property
@@ -351,11 +634,15 @@ def make_compact_ppo(
     vf_coef: float         = 0.5,
     max_grad_norm: float   = 0.5,
     ent_coef: float        = 0.01,
-    hidden: int            = 64,
-    kelly_fraction: float  = 0.5,
-    device: str            = "auto",
-    seed: int              = 42,
-    verbose: int           = 0,
+    hidden: int                              = 64,
+    kelly_fraction: float                    = 0.5,
+    kelly_per_regime: Optional[np.ndarray]   = None,
+    n_regimes: int                           = 4,
+    regime_obs_offset: int                   = 3,
+    detach_kelly: bool                       = True,   # v3.3
+    device: str                              = "auto",
+    seed: int                                = 42,
+    verbose: int                             = 0,
 ) -> PPO:
     """
     Build a PPO model with the CompactConstraintPolicy on a compact state
@@ -372,8 +659,12 @@ def make_compact_ppo(
       - vanilla PPO defaults (no MoE, no router entropy bonus)
     """
     policy_kwargs: Dict[str, Any] = dict(
-        hidden         = hidden,
-        kelly_fraction = kelly_fraction,
+        hidden            = hidden,
+        kelly_fraction    = kelly_fraction,
+        kelly_per_regime  = kelly_per_regime,
+        n_regimes         = n_regimes,
+        regime_obs_offset = regime_obs_offset,
+        detach_kelly      = detach_kelly,
     )
     return PPO(
         policy        = CompactConstraintPolicy,

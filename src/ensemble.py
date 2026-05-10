@@ -77,12 +77,17 @@ class RegimeAwareEnsemble:
         n_forecasters: int = 5,
         n_iter: int        = 1000,
         lr: float          = 0.05,
+        # v3.3: adaptive softmax temperature
+        # final temp = base_temp + alpha_temp * uncertainty
+        base_temp: float        = 1.0,
+        alpha_temp: float       = 1.5,
     ) -> None:
         self.n_regimes     = n_regimes
         self.n_forecasters = n_forecasters
         self.n_iter        = n_iter
         self.lr            = lr
-        # Logits over forecasters per regime; softmax → simplex weights
+        self.base_temp     = base_temp
+        self.alpha_temp    = alpha_temp
         self.logits: Optional[th.Tensor] = None
         self._fitted: bool = False
 
@@ -144,20 +149,33 @@ class RegimeAwareEnsemble:
     ) -> np.ndarray:
         """
         Return (T, 2) array — column 0 is ensemble μ, column 1 is ensemble σ.
-        Uses law of total variance to combine σ across mixture components.
+        v3.3: uses adaptive softmax temperature scaled by forecaster
+        disagreement.  When forecasters disagree strongly (high uncertainty)
+        the temperature increases, producing softer weights (closer to
+        uniform).  When they agree, weights sharpen toward the best-trusted
+        forecaster for the current regime.
         """
         if not self._fitted:
             raise RuntimeError("Call fit() first")
 
         rp = th.from_numpy(regime_probs.astype(np.float32))
-        mixed_logits = rp @ self.logits                             # (T, K)
-        w = F.softmax(mixed_logits, dim=-1).numpy()                 # (T, K)
+        mixed_logits = (rp @ self.logits).numpy()                  # (T, K)
 
         mu_i    = forecaster_mus.astype(np.float32)
         sigma_i = forecaster_sigmas.astype(np.float32)
 
-        mu_ens  = (w * mu_i).sum(axis=-1)                            # (T,)
-        # Law of total variance:
+        # v3.3 adaptive temperature: per-timestep disagreement
+        disagreement = mu_i.std(axis=-1, keepdims=True)            # (T, 1)
+        # Normalise by median for scale invariance
+        scale = float(np.median(disagreement) + 1e-8)
+        tau = self.base_temp + self.alpha_temp * (disagreement / scale).squeeze(-1)
+        tau = np.clip(tau, 0.5, 5.0)                                # (T,)
+
+        # Apply per-row temperature
+        exp_logits = np.exp(mixed_logits / tau[:, None])
+        w = exp_logits / (exp_logits.sum(axis=-1, keepdims=True) + 1e-12)
+
+        mu_ens  = (w * mu_i).sum(axis=-1)
         var_within  = (w * sigma_i**2).sum(axis=-1)
         var_between = (w * (mu_i - mu_ens[:, None])**2).sum(axis=-1)
         sigma_ens = np.sqrt(np.maximum(var_within + var_between, 1e-12))
@@ -174,6 +192,105 @@ class RegimeAwareEnsemble:
         if self.logits is None:
             return np.full((self.n_regimes, self.n_forecasters), 1.0 / self.n_forecasters)
         return F.softmax(self.logits, dim=-1).numpy()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v3.3 — regime classifier (trend / volatile / crisis)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def classify_regimes(hmm) -> dict:
+    """
+    Map each HMM regime index to a semantic label and a hard Kelly cap.
+
+    Labels assigned from regime characteristics:
+      crisis    : high σ AND negative smoothed μ
+      volatile  : high σ
+      trend     : low σ
+
+    Returns
+    -------
+    dict with:
+      'labels'        : list[str] of length n_regimes
+      'kelly_caps'    : np.ndarray of length n_regimes
+      'sample_weights': np.ndarray (n_regimes, n_regimes) — for regime-specialised
+                        forecaster training.  Row i = weights for forecaster
+                        specialised in regime i.
+    """
+    means = hmm.regime_means()                                # (R, F)
+    n_regimes = means.shape[0]
+    sigmas    = means[:, 1] if means.shape[1] >= 2 else np.full(n_regimes, 0.02)
+    smoothed_mu = means[:, 2] if means.shape[1] >= 3 else np.zeros(n_regimes)
+
+    # Vol classification: split into "high" (above median) vs "low"
+    sigma_median = float(np.median(sigmas))
+    labels: list = []
+    kelly_caps  = np.zeros(n_regimes, dtype=np.float32)
+    for k in range(n_regimes):
+        is_high_vol = sigmas[k] > sigma_median * 1.3
+        is_crisis   = is_high_vol and smoothed_mu[k] < -0.003
+        if is_crisis:
+            labels.append("crisis")
+            kelly_caps[k] = 0.05
+        elif is_high_vol:
+            labels.append("volatile")
+            kelly_caps[k] = 0.20
+        else:
+            labels.append("trend")
+            kelly_caps[k] = 0.50
+
+    return {
+        "labels":     labels,
+        "kelly_caps": kelly_caps,
+        "n_regimes":  n_regimes,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v3.1 — regime-aware Kelly schedule (kept for backward compat)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def kelly_per_regime_from_hmm(
+    hmm,
+    base_kelly: float       = 0.5,
+    crisis_threshold: float = -0.005,
+    crisis_penalty: float   = 0.5,
+    kelly_min: float        = 0.10,
+    kelly_max: float        = 1.0,
+) -> np.ndarray:
+    """
+    Derive a per-regime Kelly fraction from HMM regime characteristics.
+
+    Logic
+    -----
+    Each regime has a mean (μ, σ, smoothed_μ) tuple from the fitted HMM.
+    We map regime σ to Kelly fraction inversely (low-vol regimes get more
+    leverage), and apply an extra penalty for "crisis-like" regimes
+    (those with strongly negative smoothed mean return).
+
+      kelly_r  =  base_kelly * (median_σ / σ_r)
+      kelly_r *= 1 if smoothed_μ_r > -threshold else crisis_penalty
+      kelly_r  = clip(kelly_r, kelly_min, kelly_max)
+
+    Returns
+    -------
+    np.ndarray shape (n_regimes,) with per-regime Kelly fractions.
+    """
+    means = hmm.regime_means()                          # (n_regimes, n_feat)
+    if means.shape[1] < 2:
+        # Degenerate HMM — return uniform base_kelly
+        return np.full(means.shape[0], base_kelly, dtype=np.float32)
+
+    regime_vol = np.maximum(means[:, 1], 1e-4)
+    median_vol = float(np.median(regime_vol))
+    kelly_per  = base_kelly * (median_vol / regime_vol)
+
+    # Crisis penalty: regimes with strongly negative mean return get reduced kelly
+    if means.shape[1] >= 3:
+        smoothed_mu = means[:, 2]
+        is_crisis   = smoothed_mu < crisis_threshold
+        kelly_per   = np.where(is_crisis, kelly_per * crisis_penalty, kelly_per)
+
+    return np.clip(kelly_per, kelly_min, kelly_max).astype(np.float32)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

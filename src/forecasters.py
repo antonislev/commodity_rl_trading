@@ -39,21 +39,26 @@ from torch.utils.data import DataLoader, TensorDataset
 # ─────────────────────────────────────────────────────────────────────────────
 
 class BaseForecaster(ABC):
-    """All forecasters predict next-day log-return (μ) and its std (σ)."""
+    """All forecasters predict next-day log-return (μ) and its std (σ).
+
+    v3.3: fit() now accepts optional `sample_weights` for regime-specialised
+    training.  Weights have shape (n_samples,) and are aligned to df_train
+    BEFORE the lookback windowing.  Downstream forecasters use them in
+    their loss (weighted MSE for the deep nets, per-sample weights for
+    XGBoost).  Pass None to fall back to uniform weighting (default).
+    """
 
     name: str = "base"
 
     @abstractmethod
-    def fit(self, df_train: pd.DataFrame) -> "BaseForecaster": ...
+    def fit(
+        self,
+        df_train: pd.DataFrame,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> "BaseForecaster": ...
 
     @abstractmethod
-    def predict_mu_sigma(self, df: pd.DataFrame) -> np.ndarray:
-        """
-        Return (T, 2) array.  Column 0: predicted μ.  Column 1: predicted σ.
-        T must equal len(df).  First lookback rows may be filled with sample
-        mean / std (no actual prediction available).
-        """
-        ...
+    def predict_mu_sigma(self, df: pd.DataFrame) -> np.ndarray: ...
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -90,14 +95,15 @@ def _build_sequences(
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _LSTMNet(nn.Module):
-    def __init__(self, n_features, hidden=64, n_layers=2):
+    def __init__(self, n_features, hidden=64, n_layers=2, dropout=0.3):
         super().__init__()
-        self.lstm = nn.LSTM(n_features, hidden, n_layers, batch_first=True, dropout=0.1)
+        self.lstm = nn.LSTM(n_features, hidden, n_layers, batch_first=True, dropout=dropout)
+        self.dropout = nn.Dropout(dropout)
         self.head = nn.Linear(hidden, 1)
 
     def forward(self, x):
         out, _ = self.lstm(x)
-        return self.head(out[:, -1, :]).squeeze(-1)
+        return self.head(self.dropout(out[:, -1, :])).squeeze(-1)
 
 
 class LSTMForecaster(BaseForecaster):
@@ -112,6 +118,10 @@ class LSTMForecaster(BaseForecaster):
         epochs: int   = 15,
         batch_size: int = 64,
         lr: float     = 1e-3,
+        dropout: float = 0.3,            # v3.2: stronger regularisation
+        val_split: float = 0.2,          # v3.2: chronological tail used as validation
+        patience: int  = 3,              # v3.2: early-stopping patience
+        weight_decay: float = 1e-5,      # v3.2: L2 regularisation
         device: str   = "auto",
     ) -> None:
         self.feature_cols = list(feature_cols)
@@ -121,6 +131,10 @@ class LSTMForecaster(BaseForecaster):
         self.epochs       = epochs
         self.batch_size   = batch_size
         self.lr           = lr
+        self.dropout      = dropout
+        self.val_split    = val_split
+        self.patience     = patience
+        self.weight_decay = weight_decay
         self.device       = th.device("cuda" if (device == "auto" and th.cuda.is_available()) else device if device != "auto" else "cpu")
         self.net: Optional[_LSTMNet]            = None
         self.feat_mean: Optional[np.ndarray]    = None
@@ -130,8 +144,11 @@ class LSTMForecaster(BaseForecaster):
     def _normalise(self, X: np.ndarray) -> np.ndarray:
         return (X - self.feat_mean) / (self.feat_std + 1e-8)
 
-    def fit(self, df_train: pd.DataFrame) -> "LSTMForecaster":
-        # Z-score features on training only
+    def fit(
+        self,
+        df_train: pd.DataFrame,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> "LSTMForecaster":
         feats = df_train[self.feature_cols].values.astype(np.float32)
         self.feat_mean = feats.mean(0, keepdims=True)
         self.feat_std  = feats.std(0, keepdims=True) + 1e-8
@@ -141,27 +158,65 @@ class LSTMForecaster(BaseForecaster):
             self.sigma = float(df_train["log_return"].std())
             return self
         X = (X - self.feat_mean) / self.feat_std
-        Xt = th.from_numpy(X).to(self.device)
-        yt = th.from_numpy(y).to(self.device)
 
-        self.net = _LSTMNet(len(self.feature_cols), self.hidden, self.n_layers).to(self.device)
-        opt = th.optim.Adam(self.net.parameters(), lr=self.lr)
-        loader = DataLoader(TensorDataset(Xt, yt), batch_size=self.batch_size, shuffle=True)
-        self.net.train()
+        # v3.3: sample weights aligned with target indices (i.e. position lookback+i)
+        if sample_weights is not None:
+            w = np.asarray(sample_weights, dtype=np.float32)
+            w = w[self.lookback:self.lookback + len(X)] if len(w) > len(X) else w[:len(X)]
+            # Normalise to mean=1 so loss scale is unchanged
+            w = w * (len(w) / (w.sum() + 1e-8))
+        else:
+            w = np.ones(len(X), dtype=np.float32)
+
+        n_val = max(int(len(X) * self.val_split), 10)
+        X_tr, X_vl = X[:-n_val], X[-n_val:]
+        y_tr, y_vl = y[:-n_val], y[-n_val:]
+        w_tr        = w[:-n_val]
+        Xtr_t = th.from_numpy(X_tr).to(self.device)
+        ytr_t = th.from_numpy(y_tr).to(self.device)
+        wtr_t = th.from_numpy(w_tr).to(self.device)
+        Xvl_t = th.from_numpy(X_vl).to(self.device)
+        yvl_t = th.from_numpy(y_vl).to(self.device)
+
+        self.net = _LSTMNet(len(self.feature_cols), self.hidden, self.n_layers, self.dropout).to(self.device)
+        opt = th.optim.Adam(self.net.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        loader = DataLoader(
+            TensorDataset(Xtr_t, ytr_t, wtr_t), batch_size=self.batch_size, shuffle=True,
+        )
+
+        best_val = float("inf")
+        best_state = None
+        bad_epochs = 0
         for _ in range(self.epochs):
-            for xb, yb in loader:
+            self.net.train()
+            for xb, yb, wb in loader:
                 opt.zero_grad()
                 pred = self.net(xb)
-                loss = F.mse_loss(pred, yb)
+                # Weighted MSE
+                loss = (wb * (pred - yb) ** 2).mean()
                 loss.backward()
                 th.nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
                 opt.step()
 
-        # Estimate residual std on training data
+            self.net.eval()
+            with th.no_grad():
+                val_loss = F.mse_loss(self.net(Xvl_t), yvl_t).item()
+            if val_loss < best_val:
+                best_val = val_loss
+                best_state = {k: v.detach().clone() for k, v in self.net.state_dict().items()}
+                bad_epochs = 0
+            else:
+                bad_epochs += 1
+                if bad_epochs >= self.patience:
+                    break
+
+        if best_state is not None:
+            self.net.load_state_dict(best_state)
+
         self.net.eval()
         with th.no_grad():
-            preds = self.net(Xt).cpu().numpy()
-        self.sigma = float(np.std(y - preds) + 1e-6)
+            preds_full = self.net(th.from_numpy(X).to(self.device)).cpu().numpy()
+        self.sigma = float(np.std(y - preds_full) + 1e-6)
         return self
 
     def predict_mu_sigma(self, df: pd.DataFrame) -> np.ndarray:
@@ -191,21 +246,22 @@ class LSTMForecaster(BaseForecaster):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _TransformerNet(nn.Module):
-    def __init__(self, n_features, d_model=32, nhead=4, n_layers=2, lookback=60):
+    def __init__(self, n_features, d_model=32, nhead=4, n_layers=2, lookback=60, dropout=0.3):
         super().__init__()
         self.input_proj = nn.Linear(n_features, d_model)
         self.pos_embed  = nn.Parameter(th.randn(1, lookback, d_model) * 0.02)
         encoder_layer   = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=d_model*2,
-            dropout=0.1, batch_first=True,
+            dropout=dropout, batch_first=True,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.head_drop = nn.Dropout(dropout)
         self.head    = nn.Linear(d_model, 1)
 
     def forward(self, x):
         z = self.input_proj(x) + self.pos_embed[:, :x.size(1)]
         z = self.encoder(z)
-        return self.head(z[:, -1, :]).squeeze(-1)
+        return self.head(self.head_drop(z[:, -1, :])).squeeze(-1)
 
 
 class TransformerForecaster(BaseForecaster):
@@ -221,6 +277,10 @@ class TransformerForecaster(BaseForecaster):
         epochs: int   = 15,
         batch_size: int = 64,
         lr: float     = 5e-4,
+        dropout: float = 0.3,
+        val_split: float = 0.2,
+        patience: int  = 3,
+        weight_decay: float = 1e-5,
         device: str   = "auto",
     ) -> None:
         self.feature_cols = list(feature_cols)
@@ -231,13 +291,21 @@ class TransformerForecaster(BaseForecaster):
         self.epochs       = epochs
         self.batch_size   = batch_size
         self.lr           = lr
+        self.dropout      = dropout
+        self.val_split    = val_split
+        self.patience     = patience
+        self.weight_decay = weight_decay
         self.device       = th.device("cuda" if (device == "auto" and th.cuda.is_available()) else device if device != "auto" else "cpu")
         self.net: Optional[_TransformerNet] = None
         self.feat_mean = None
         self.feat_std  = None
         self.sigma     = 0.02
 
-    def fit(self, df_train: pd.DataFrame) -> "TransformerForecaster":
+    def fit(
+        self,
+        df_train: pd.DataFrame,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> "TransformerForecaster":
         feats = df_train[self.feature_cols].values.astype(np.float32)
         self.feat_mean = feats.mean(0, keepdims=True)
         self.feat_std  = feats.std(0, keepdims=True) + 1e-8
@@ -247,27 +315,64 @@ class TransformerForecaster(BaseForecaster):
             self.sigma = float(df_train["log_return"].std())
             return self
         X = (X - self.feat_mean) / self.feat_std
-        Xt = th.from_numpy(X).to(self.device)
-        yt = th.from_numpy(y).to(self.device)
+
+        if sample_weights is not None:
+            w = np.asarray(sample_weights, dtype=np.float32)
+            w = w[self.lookback:self.lookback + len(X)] if len(w) > len(X) else w[:len(X)]
+            w = w * (len(w) / (w.sum() + 1e-8))
+        else:
+            w = np.ones(len(X), dtype=np.float32)
+
+        n_val = max(int(len(X) * self.val_split), 10)
+        X_tr, X_vl = X[:-n_val], X[-n_val:]
+        y_tr, y_vl = y[:-n_val], y[-n_val:]
+        w_tr = w[:-n_val]
+        Xtr_t = th.from_numpy(X_tr).to(self.device)
+        ytr_t = th.from_numpy(y_tr).to(self.device)
+        wtr_t = th.from_numpy(w_tr).to(self.device)
+        Xvl_t = th.from_numpy(X_vl).to(self.device)
+        yvl_t = th.from_numpy(y_vl).to(self.device)
 
         self.net = _TransformerNet(
             len(self.feature_cols), self.d_model, self.nhead, self.n_layers, self.lookback,
+            dropout=self.dropout,
         ).to(self.device)
-        opt = th.optim.Adam(self.net.parameters(), lr=self.lr)
-        loader = DataLoader(TensorDataset(Xt, yt), batch_size=self.batch_size, shuffle=True)
-        self.net.train()
+        opt = th.optim.Adam(self.net.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        loader = DataLoader(
+            TensorDataset(Xtr_t, ytr_t, wtr_t), batch_size=self.batch_size, shuffle=True,
+        )
+
+        best_val = float("inf")
+        best_state = None
+        bad_epochs = 0
         for _ in range(self.epochs):
-            for xb, yb in loader:
+            self.net.train()
+            for xb, yb, wb in loader:
                 opt.zero_grad()
-                loss = F.mse_loss(self.net(xb), yb)
+                pred = self.net(xb)
+                loss = (wb * (pred - yb) ** 2).mean()
                 loss.backward()
                 th.nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
                 opt.step()
+            self.net.eval()
+            with th.no_grad():
+                val_loss = F.mse_loss(self.net(Xvl_t), yvl_t).item()
+            if val_loss < best_val:
+                best_val = val_loss
+                best_state = {k: v.detach().clone() for k, v in self.net.state_dict().items()}
+                bad_epochs = 0
+            else:
+                bad_epochs += 1
+                if bad_epochs >= self.patience:
+                    break
+
+        if best_state is not None:
+            self.net.load_state_dict(best_state)
 
         self.net.eval()
         with th.no_grad():
-            preds = self.net(Xt).cpu().numpy()
-        self.sigma = float(np.std(y - preds) + 1e-6)
+            preds_full = self.net(th.from_numpy(X).to(self.device)).cpu().numpy()
+        self.sigma = float(np.std(y - preds_full) + 1e-6)
         return self
 
     def predict_mu_sigma(self, df: pd.DataFrame) -> np.ndarray:
@@ -313,22 +418,32 @@ class XGBoostForecaster(BaseForecaster):
         self.model         = None
         self.sigma         = 0.02
 
-    def fit(self, df_train: pd.DataFrame) -> "XGBoostForecaster":
+    def fit(
+        self,
+        df_train: pd.DataFrame,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> "XGBoostForecaster":
         from xgboost import XGBRegressor
 
-        # Predict next-day return from current-day features
-        X = df_train[self.feature_cols].values[:-1]   # features at t
-        y = df_train["log_return"].fillna(0).values[1:]  # target = log_ret at t+1
+        X = df_train[self.feature_cols].values[:-1]
+        y = df_train["log_return"].fillna(0).values[1:]
         if len(X) < 50:
             self.sigma = float(df_train["log_return"].std())
             return self
+
+        # v3.3 regime-specialised: align weights with X (drop last entry)
+        sw = None
+        if sample_weights is not None:
+            sw = np.asarray(sample_weights, dtype=np.float32)
+            sw = sw[:len(X)]
+            sw = sw * (len(sw) / (sw.sum() + 1e-8))
 
         self.model = XGBRegressor(
             n_estimators=self.n_estimators, max_depth=self.max_depth,
             learning_rate=self.learning_rate, objective="reg:squarederror",
             random_state=self.random_state, n_jobs=-1, verbosity=0,
         )
-        self.model.fit(X, y)
+        self.model.fit(X, y, sample_weight=sw)
         preds = self.model.predict(X)
         self.sigma = float(np.std(y - preds) + 1e-6)
         return self
@@ -380,6 +495,9 @@ class CNNForecaster(BaseForecaster):
         epochs: int   = 15,
         batch_size: int = 64,
         lr: float     = 1e-3,
+        val_split: float = 0.2,
+        patience: int  = 3,
+        weight_decay: float = 1e-5,
         device: str   = "auto",
     ) -> None:
         self.feature_cols = list(feature_cols)
@@ -388,13 +506,20 @@ class CNNForecaster(BaseForecaster):
         self.epochs       = epochs
         self.batch_size   = batch_size
         self.lr           = lr
+        self.val_split    = val_split
+        self.patience     = patience
+        self.weight_decay = weight_decay
         self.device       = th.device("cuda" if (device == "auto" and th.cuda.is_available()) else device if device != "auto" else "cpu")
         self.net          = None
         self.feat_mean    = None
         self.feat_std     = None
         self.sigma        = 0.02
 
-    def fit(self, df_train: pd.DataFrame) -> "CNNForecaster":
+    def fit(
+        self,
+        df_train: pd.DataFrame,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> "CNNForecaster":
         feats = df_train[self.feature_cols].values.astype(np.float32)
         self.feat_mean = feats.mean(0, keepdims=True)
         self.feat_std  = feats.std(0, keepdims=True) + 1e-8
@@ -404,25 +529,61 @@ class CNNForecaster(BaseForecaster):
             self.sigma = float(df_train["log_return"].std())
             return self
         X = (X - self.feat_mean) / self.feat_std
-        Xt = th.from_numpy(X).to(self.device)
-        yt = th.from_numpy(y).to(self.device)
+
+        if sample_weights is not None:
+            w = np.asarray(sample_weights, dtype=np.float32)
+            w = w[self.lookback:self.lookback + len(X)] if len(w) > len(X) else w[:len(X)]
+            w = w * (len(w) / (w.sum() + 1e-8))
+        else:
+            w = np.ones(len(X), dtype=np.float32)
+
+        n_val = max(int(len(X) * self.val_split), 10)
+        X_tr, X_vl = X[:-n_val], X[-n_val:]
+        y_tr, y_vl = y[:-n_val], y[-n_val:]
+        w_tr = w[:-n_val]
+        Xtr_t = th.from_numpy(X_tr).to(self.device)
+        ytr_t = th.from_numpy(y_tr).to(self.device)
+        wtr_t = th.from_numpy(w_tr).to(self.device)
+        Xvl_t = th.from_numpy(X_vl).to(self.device)
+        yvl_t = th.from_numpy(y_vl).to(self.device)
 
         self.net = _CNNNet(len(self.feature_cols), self.channels, self.lookback).to(self.device)
-        opt = th.optim.Adam(self.net.parameters(), lr=self.lr)
-        loader = DataLoader(TensorDataset(Xt, yt), batch_size=self.batch_size, shuffle=True)
-        self.net.train()
+        opt = th.optim.Adam(self.net.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        loader = DataLoader(
+            TensorDataset(Xtr_t, ytr_t, wtr_t), batch_size=self.batch_size, shuffle=True,
+        )
+
+        best_val = float("inf")
+        best_state = None
+        bad_epochs = 0
         for _ in range(self.epochs):
-            for xb, yb in loader:
+            self.net.train()
+            for xb, yb, wb in loader:
                 opt.zero_grad()
-                loss = F.mse_loss(self.net(xb), yb)
+                pred = self.net(xb)
+                loss = (wb * (pred - yb) ** 2).mean()
                 loss.backward()
                 th.nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
                 opt.step()
+            self.net.eval()
+            with th.no_grad():
+                val_loss = F.mse_loss(self.net(Xvl_t), yvl_t).item()
+            if val_loss < best_val:
+                best_val = val_loss
+                best_state = {k: v.detach().clone() for k, v in self.net.state_dict().items()}
+                bad_epochs = 0
+            else:
+                bad_epochs += 1
+                if bad_epochs >= self.patience:
+                    break
+
+        if best_state is not None:
+            self.net.load_state_dict(best_state)
 
         self.net.eval()
         with th.no_grad():
-            preds = self.net(Xt).cpu().numpy()
-        self.sigma = float(np.std(y - preds) + 1e-6)
+            preds_full = self.net(th.from_numpy(X).to(self.device)).cpu().numpy()
+        self.sigma = float(np.std(y - preds_full) + 1e-6)
         return self
 
     def predict_mu_sigma(self, df: pd.DataFrame) -> np.ndarray:
@@ -464,7 +625,12 @@ class GARCHForecaster(BaseForecaster):
         self.mu     = 0.0
         self.sigma_const = 0.02
 
-    def fit(self, df_train: pd.DataFrame) -> "GARCHForecaster":
+    def fit(
+        self,
+        df_train: pd.DataFrame,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> "GARCHForecaster":
+        # GARCH does not use sample_weights (volatility model)
         from arch import arch_model
         rets = (df_train["log_return"].fillna(0) * self.scale).values
         if len(rets) < 100:
